@@ -1,41 +1,43 @@
 using SDRSharp.Common;
 using SDRSharp.Radio;
 using System;
-using System.Buffers;
 using System.Collections.Generic;
-using System.Threading;
 
 namespace SDRSharp.Tetra.MultiChannel
 {
+    /// <summary>
+    /// Wideband IQ source for the multichannel decoder.
+    ///
+    /// IMPORTANT: For true multichannel operation the stream must be PRE-VFO.
+    /// If you hook a post-VFO stream (e.g. DecimatedAndFilteredIQ), SDR# will
+    /// frequency-shift the signal based on the currently selected VFO. That
+    /// makes *all* channels follow whatever you click in the waterfall.
+    ///
+    /// We therefore hook ProcessorType.RawIQ and do per-channel DDC in each sink.
+    ///
+    /// Performance: this class does NOT copy IQ buffers. It dispatches directly
+    /// to sinks on the SDR# callback thread. Sinks must process synchronously and
+    /// must not store the pointer after returning.
+    /// </summary>
     public unsafe class WideIqSource : IDisposable
     {
         private readonly ISharpControl _control;
         private readonly WideIqProcessor _proc;
 
         private readonly object _lock = new();
-        private readonly Queue<(Complex[] buf, int len, double fs)> _queue = new();
         private readonly List<IWideIqSink> _sinks = new();
-
-        private Thread _worker;
-        private volatile bool _running;
 
         public double LastSampleRate { get; private set; }
 
         public WideIqSource(ISharpControl control)
         {
             _control = control;
-
             _proc = new WideIqProcessor();
             _proc.IQReady += OnIqReady;
             _proc.Enabled = true;
 
-            // Use the SAME IQ stream type as the working single-channel decoder:
-            // This is the most compatible path across RTL-SDR and Airspy in SDR# builds.
-            _control.RegisterStreamHook(_proc, ProcessorType.DecimatedAndFilteredIQ);
-
-            _running = true;
-            _worker = new Thread(Worker) { IsBackground = true, Name = "TetraWideIQ" };
-            _worker.Start();
+            // Pre-VFO stream required for true multichannel
+            _control.RegisterStreamHook(_proc, ProcessorType.RawIQ);
         }
 
         public void AddSink(IWideIqSink sink)
@@ -57,70 +59,97 @@ namespace SDRSharp.Tetra.MultiChannel
 
         private void OnIqReady(Complex* samples, double samplerate, int length)
         {
-            if (!_running) return;
             if (length <= 0) return;
 
-            // For DecimatedAndFilteredIQ, samplerate is normally valid and should be trusted.
-            if (double.IsNaN(samplerate) || double.IsInfinity(samplerate) || samplerate <= 1)
+            // Some SDR# builds/devices don't populate IIQProcessor.SampleRate for RawIQ.
+            // Fall back to probing common control properties.
+            if (!IsSaneSampleRate(samplerate))
+            {
+                var sr = TryGetSampleRateHz(_control);
+                if (IsSaneSampleRate(sr))
+                    samplerate = sr;
+            }
+
+            if (!IsSaneSampleRate(samplerate))
                 return;
 
             LastSampleRate = samplerate;
 
-            var arr = ArrayPool<Complex>.Shared.Rent(length);
-            for (int i = 0; i < length; i++)
-                arr[i] = samples[i];
-
+            IWideIqSink[] snapshot;
             lock (_lock)
             {
-                _queue.Enqueue((arr, length, samplerate));
-                Monitor.Pulse(_lock);
+                if (_sinks.Count == 0) return;
+                snapshot = _sinks.ToArray();
+            }
 
-                // Avoid backlog / RAM spike
-                while (_queue.Count > 8)
-                {
-                    var old = _queue.Dequeue();
-                    ArrayPool<Complex>.Shared.Return(old.buf);
-                }
+            // Dispatch directly; no copying.
+            for (int i = 0; i < snapshot.Length; i++)
+            {
+                try { snapshot[i].OnWideIq(samples, samplerate, length); }
+                catch { /* isolate channel failures */ }
             }
         }
 
-        private void Worker()
+        private static bool IsSaneSampleRate(double fs)
         {
-            while (_running)
+            if (double.IsNaN(fs) || double.IsInfinity(fs)) return false;
+            return fs >= 8_000 && fs <= 50_000_000;
+        }
+
+        private static double TryGetSampleRateHz(ISharpControl control)
+        {
+            if (control == null) return 0;
+
+            try
             {
-                (Complex[] buf, int len, double fs) item;
-                List<IWideIqSink> sinksSnapshot;
+                var t = control.GetType();
 
-                lock (_lock)
+                // SDR# Common exposes InputSampleRate in many builds.
+                foreach (var name in new[]
                 {
-                    while (_queue.Count == 0 && _running)
-                        Monitor.Wait(_lock, 200);
-
-                    if (!_running) break;
-                    if (_queue.Count == 0) continue;
-
-                    item = _queue.Dequeue();
-                    sinksSnapshot = new List<IWideIqSink>(_sinks);
+                    "InputSampleRate",
+                    "SampleRate",
+                    "Samplerate",
+                    "DeviceSampleRate",
+                    "RadioSampleRate",
+                    "IFSampleRate"
+                })
+                {
+                    var p = t.GetProperty(name);
+                    if (p == null) continue;
+                    var v = p.GetValue(control, null);
+                    if (v is int i) return i;
+                    if (v is long l) return l;
+                    if (v is double d) return d;
+                    if (v is float f) return f;
                 }
 
-                fixed (Complex* p = item.buf)
+                // Heuristic: any property containing "Sample" and "Rate".
+                foreach (var p in t.GetProperties())
                 {
-                    for (int i = 0; i < sinksSnapshot.Count; i++)
+                    var n = p.Name;
+                    if (n.IndexOf("Sample", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                        n.IndexOf("Rate", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        try { sinksSnapshot[i].OnWideIq(p, item.fs, item.len); }
-                        catch { /* isolate channel failures */ }
+                        var v = p.GetValue(control, null);
+                        if (v is int i) return i;
+                        if (v is long l) return l;
+                        if (v is double d) return d;
+                        if (v is float f) return f;
                     }
                 }
-
-                ArrayPool<Complex>.Shared.Return(item.buf);
             }
+            catch { }
+
+            return 0;
         }
 
         public void Dispose()
         {
-            _running = false;
-            lock (_lock) { Monitor.PulseAll(_lock); }
-            try { _worker?.Join(500); } catch { }
+            // SDR# doesn't provide an unregister hook in the public API.
+            // We just stop dispatching by clearing sinks and detaching.
+            try { _proc.IQReady -= OnIqReady; } catch { }
+            lock (_lock) { _sinks.Clear(); }
         }
     }
 
