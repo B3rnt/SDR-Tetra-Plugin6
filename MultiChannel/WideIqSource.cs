@@ -10,10 +10,7 @@ namespace SDRSharp.Tetra.MultiChannel
     public unsafe class WideIqSource : IDisposable
     {
         private readonly ISharpControl _control;
-
-        // Two processors: prefer RawIQ, fallback to DecimatedAndFilteredIQ
-        private readonly WideIqProcessor _rawProc;
-        private readonly WideIqProcessor _dfProc;
+        private readonly WideIqProcessor _proc;
 
         private readonly object _lock = new();
         private readonly Queue<(Complex[] buf, int len, double fs)> _queue = new();
@@ -24,34 +21,17 @@ namespace SDRSharp.Tetra.MultiChannel
 
         public double LastSampleRate { get; private set; }
 
-        private enum ActiveStream { Unknown, RawIQ, DecimatedFilteredIQ }
-        private volatile ActiveStream _active = ActiveStream.Unknown;
-
-        // Heuristics / stability detection
-        private int _rawBadCount = 0;
-        private int _rawGoodCount = 0;
-
-        // Tune these if needed
-        private const int RawGoodThreshold = 3;   // sane RawIQ callbacks before we "lock" to Raw
-        private const int RawBadThreshold  = 10;  // invalid RawIQ callbacks before we switch
-
         public WideIqSource(ISharpControl control)
         {
             _control = control;
 
-            _rawProc = new WideIqProcessor();
-            _rawProc.IQReady += (p, fs, len) => OnIqReady(ActiveStream.RawIQ, p, fs, len);
-            _rawProc.Enabled = true;
+            _proc = new WideIqProcessor();
+            _proc.IQReady += OnIqReady;
+            _proc.Enabled = true;
 
-            _dfProc = new WideIqProcessor();
-            _dfProc.IQReady += (p, fs, len) => OnIqReady(ActiveStream.DecimatedFilteredIQ, p, fs, len);
-            _dfProc.Enabled = true;
-
-            // Register both. We pick the best at runtime.
-            _control.RegisterStreamHook(_rawProc, ProcessorType.RawIQ);
-
-            // This is the stable "baseband/filtered" IQ in this SDR# SDK:
-            _control.RegisterStreamHook(_dfProc, ProcessorType.DecimatedAndFilteredIQ);
+            // Use the SAME IQ stream type as the working single-channel decoder:
+            // This is the most compatible path across RTL-SDR and Airspy in SDR# builds.
+            _control.RegisterStreamHook(_proc, ProcessorType.DecimatedAndFilteredIQ);
 
             _running = true;
             _worker = new Thread(Worker) { IsBackground = true, Name = "TetraWideIQ" };
@@ -75,67 +55,17 @@ namespace SDRSharp.Tetra.MultiChannel
             }
         }
 
-        private void OnIqReady(ActiveStream stream, Complex* samples, double samplerate, int length)
+        private void OnIqReady(Complex* samples, double samplerate, int length)
         {
-            if (!_running || length <= 0) return;
+            if (!_running) return;
+            if (length <= 0) return;
 
-            // Some SDR# frontends/device plugins may invoke RawIQ hooks with samplerate = 0.
-            // Fallback to control/device properties if needed.
-            if (!IsSaneSampleRate(samplerate))
-            {
-                var fsFallback = TryGetSampleRateHz(_control);
-                if (IsSaneSampleRate(fsFallback))
-                    samplerate = fsFallback;
-            }
-
-            // Decide active stream
-            if (_active == ActiveStream.Unknown)
-            {
-                if (stream == ActiveStream.RawIQ)
-                {
-                    if (IsSaneSampleRate(samplerate)) _rawGoodCount++;
-                    else _rawBadCount++;
-
-                    if (_rawGoodCount >= RawGoodThreshold)
-                        _active = ActiveStream.RawIQ;
-
-                    if (_rawBadCount >= RawBadThreshold)
-                        _active = ActiveStream.DecimatedFilteredIQ;
-                }
-                else if (stream == ActiveStream.DecimatedFilteredIQ)
-                {
-                    // If the decimated/filtered stream is sane and RawIQ isn't proving itself, take it.
-                    if (IsSaneSampleRate(samplerate) && _rawGoodCount == 0 && _rawBadCount >= 3)
-                        _active = ActiveStream.DecimatedFilteredIQ;
-
-                    // Also: if this is the first sane stream we see, pick it.
-                    if (IsSaneSampleRate(samplerate) && _rawGoodCount == 0 && _rawBadCount == 0)
-                        _active = ActiveStream.DecimatedFilteredIQ;
-                }
-            }
-            else if (_active == ActiveStream.RawIQ)
-            {
-                // If we are using RawIQ but it's now consistently invalid, fall back
-                if (stream == ActiveStream.RawIQ)
-                {
-                    if (!IsSaneSampleRate(samplerate)) _rawBadCount++;
-                    else _rawBadCount = 0;
-
-                    if (_rawBadCount >= RawBadThreshold)
-                        _active = ActiveStream.DecimatedFilteredIQ;
-                }
-            }
-
-            // Only forward samples from the active stream
-            if (_active != stream)
+            // For DecimatedAndFilteredIQ, samplerate is normally valid and should be trusted.
+            if (double.IsNaN(samplerate) || double.IsInfinity(samplerate) || samplerate <= 1)
                 return;
-
-            if (!IsSaneSampleRate(samplerate))
-                return; // don't poison downstream DDC with 0/NaN
 
             LastSampleRate = samplerate;
 
-            // Copy samples into managed buffer (pooled)
             var arr = ArrayPool<Complex>.Shared.Rent(length);
             for (int i = 0; i < length; i++)
                 arr[i] = samples[i];
@@ -145,89 +75,13 @@ namespace SDRSharp.Tetra.MultiChannel
                 _queue.Enqueue((arr, length, samplerate));
                 Monitor.Pulse(_lock);
 
-                // Limit backlog
+                // Avoid backlog / RAM spike
                 while (_queue.Count > 8)
                 {
                     var old = _queue.Dequeue();
                     ArrayPool<Complex>.Shared.Return(old.buf);
                 }
             }
-        }
-
-        private static bool IsSaneSampleRate(double fs)
-        {
-            if (double.IsNaN(fs) || double.IsInfinity(fs)) return false;
-            // sanity bounds
-            return fs >= 8000 && fs <= 50_000_000;
-        }
-
-        private static double TryGetSampleRateHz(ISharpControl control)
-        {
-            if (control == null) return 0;
-
-            var t = control.GetType();
-            foreach (var name in new[]
-            {
-                "SampleRate",
-                "InputSampleRate",
-                "BasebandSampleRate",
-                "SamplingRate",
-                "DeviceSampleRate",
-                "OutputSampleRate"
-            })
-            {
-                var pi = t.GetProperty(name);
-                if (pi == null) continue;
-
-                try
-                {
-                    var v = pi.GetValue(control, null);
-                    if (v is int i) return i;
-                    if (v is long l) return l;
-                    if (v is double d) return d;
-                    if (v is float f) return f;
-                }
-                catch { }
-            }
-
-            var srcProp = t.GetProperty("Source") ?? t.GetProperty("Frontend") ?? t.GetProperty("Device");
-            if (srcProp != null)
-            {
-                try
-                {
-                    var src = srcProp.GetValue(control, null);
-                    if (src != null)
-                    {
-                        var st = src.GetType();
-                        foreach (var name in new[]
-                        {
-                            "SampleRate",
-                            "InputSampleRate",
-                            "BasebandSampleRate",
-                            "SamplingRate",
-                            "DeviceSampleRate",
-                            "OutputSampleRate"
-                        })
-                        {
-                            var pi = st.GetProperty(name);
-                            if (pi == null) continue;
-
-                            try
-                            {
-                                var v = pi.GetValue(src, null);
-                                if (v is int i) return i;
-                                if (v is long l) return l;
-                                if (v is double d) return d;
-                                if (v is float f) return f;
-                            }
-                            catch { }
-                        }
-                    }
-                }
-                catch { }
-            }
-
-            return 0;
         }
 
         private void Worker()
