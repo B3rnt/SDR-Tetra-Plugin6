@@ -12,6 +12,7 @@ namespace SDRSharp.Tetra.MultiChannel
     public class TetraMultiPanel : UserControl
     {
         private readonly ISharpControl _control;
+        private readonly string _instanceId;
         private readonly WideIqSource _wideSource;
 
         private readonly BindingList<ChannelSettings> _channels;
@@ -29,12 +30,13 @@ namespace SDRSharp.Tetra.MultiChannel
         // Add/RemoveSink can be called from different threads during scanning.
         private readonly object _sinkLock = new object();
 
-        public TetraMultiPanel(ISharpControl control)
+        public TetraMultiPanel(ISharpControl control, string instanceId = null)
         {
             _control = control;
+            _instanceId = instanceId;
 
             // Load channels first (so GUI is ready even if IQ hook fails)
-            var list = ChannelSettingsStore.Load();
+            var list = ChannelSettingsStore.Load(_instanceId);
             _channels = new BindingList<ChannelSettings>(list);
 
             BuildUi();

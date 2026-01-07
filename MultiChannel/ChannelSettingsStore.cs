@@ -7,52 +7,48 @@ namespace SDRSharp.Tetra.MultiChannel
 {
     public static class ChannelSettingsStore
     {
-        private const string FileName = "SDRSharp.Tetra.MultiChannels.xml";
+        private const string DefaultFileName = "SDRSharp.Tetra.MultiChannels.xml";
 
-        public static string GetSettingsPath()
+        private static string GetFileName(string instanceId)
+        {
+            if (string.IsNullOrWhiteSpace(instanceId))
+                return DefaultFileName;
+
+            // Keep it filesystem-safe
+            foreach (var c in Path.GetInvalidFileNameChars())
+                instanceId = instanceId.Replace(c, '_');
+
+            return $"SDRSharp.Tetra.MultiChannels.{instanceId}.xml";
+        }
+
+        public static string GetSettingsPath(string instanceId = null)
         {
             var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SDRSharp");
             Directory.CreateDirectory(dir);
-            return Path.Combine(dir, FileName);
+            return Path.Combine(dir, GetFileName(instanceId));
         }
 
-        public static List<ChannelSettings> Load()
+        public static List<ChannelSettings> Load(string instanceId = null)
         {
-            var path = GetSettingsPath();
+            var path = GetSettingsPath(instanceId);
+            if (!File.Exists(path))
+                return new List<ChannelSettings>();
+
             try
             {
-                if (!File.Exists(path))
-                {
-                    // Default example channel (user can edit in GUI)
-                    return new List<ChannelSettings>
-                    {
-                        new ChannelSettings { Name = "TETRA-1", FrequencyHz = 0, Enabled = true }
-                    };
-                }
-
                 using var fs = File.OpenRead(path);
                 var ser = new XmlSerializer(typeof(List<ChannelSettings>));
-                if (ser.Deserialize(fs) is List<ChannelSettings> list)
-                {
-                    // Ensure IDs exist
-                    foreach (var ch in list)
-                    {
-                        if (ch.Id == Guid.Empty) ch.Id = Guid.NewGuid();
-                    }
-                    return list;
-                }
+                return (List<ChannelSettings>)ser.Deserialize(fs);
             }
             catch
             {
-                // ignore and fall back
+                return new List<ChannelSettings>();
             }
-
-            return new List<ChannelSettings>();
         }
 
-        public static void Save(List<ChannelSettings> channels)
+        public static void Save(List<ChannelSettings> channels, string instanceId = null)
         {
-            var path = GetSettingsPath();
+            var path = GetSettingsPath(instanceId);
             using var fs = File.Create(path);
             var ser = new XmlSerializer(typeof(List<ChannelSettings>));
             ser.Serialize(fs, channels);

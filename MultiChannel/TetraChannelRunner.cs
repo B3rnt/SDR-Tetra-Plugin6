@@ -99,68 +99,53 @@ namespace SDRSharp.Tetra.MultiChannel
 
 
         private static long GetCenterFrequencyHz(ISharpControl control)
-{
-    try
-    {
-        var t = control.GetType();
-
-        static long AsLong(object v)
         {
-            if (v is long ll) return ll;
-            if (v is int ii) return ii;
-            if (v is double dd) return (long)dd;
-            if (v is float ff) return (long)ff;
-            return 0;
-        }
-
-        // 1) Preferred: CenterFrequency (tuner/LO frequency, pre-VFO)
-        var pCenter = t.GetProperty("CenterFrequency");
-        if (pCenter != null)
-        {
-            var c = AsLong(pCenter.GetValue(control, null));
-            if (c > 0) return c;
-        }
-
-        // 2) If we have VFOFrequency and RelativeVFOFrequency, compute:
-        //    relative = VFO - Center  => Center = VFO - relative
-        var pVfo = t.GetProperty("VFOFrequency") ?? t.GetProperty("VfoFrequency");
-        var pRel = t.GetProperty("RelativeVFOFrequency") ?? t.GetProperty("RelativeVfoFrequency");
-        if (pVfo != null && pRel != null)
-        {
-            var vfo = AsLong(pVfo.GetValue(control, null));
-            var rel = AsLong(pRel.GetValue(control, null));
-            if (vfo > 0)
+            try
             {
-                var center = vfo - rel;
-                if (center > 0) return center;
+                var t = control.GetType();
+
+                // Try common property names used across SDR# builds/forks.
+                foreach (var name in new[]
+                {
+                    "CenterFrequency",
+                    "LOFrequency",
+                    "RfFrequency",
+                    "RFFrequency",
+                    "RadioFrequency",
+                    "DeviceFrequency",
+                    "HardwareFrequency"
+                })
+                {
+                    var p = t.GetProperty(name);
+                    if (p == null) continue;
+                    var v = p.GetValue(control, null);
+                    if (v is long l) return l;
+                    if (v is int i) return i;
+                    if (v is double d) return (long)d;
+                }
+
+                // Heuristic: any property containing "Center" and "Frequency".
+                foreach (var p in t.GetProperties())
+                {
+                    var n = p.Name;
+                    if (n.IndexOf("Center", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                        n.IndexOf("Freq", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        var v = p.GetValue(control, null);
+                        if (v is long l) return l;
+                        if (v is int i) return i;
+                        if (v is double d) return (long)d;
+                    }
+                }
+
+                // Fall back to the currently tuned frequency.
+                return control.Frequency;
+            }
+            catch
+            {
+                return control.Frequency;
             }
         }
-
-        // 3) Other common names across forks
-        foreach (var name in new[]
-        {
-            "LOFrequency",
-            "RfFrequency",
-            "RFFrequency",
-            "RadioFrequency",
-            "DeviceFrequency",
-            "HardwareFrequency"
-        })
-        {
-            var p = t.GetProperty(name);
-            if (p == null) continue;
-            var v = AsLong(p.GetValue(control, null));
-            if (v > 0) return v;
-        }
-
-        // 4) Last resort: SDR#'s ISharpControl.Frequency
-        return control.Frequency;
-    }
-    catch
-    {
-        return control.Frequency;
-    }
-}
 
         private void EnsureOutBuffer(int complexCount)
         {
