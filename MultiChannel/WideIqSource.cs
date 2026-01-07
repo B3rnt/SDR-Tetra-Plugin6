@@ -64,6 +64,15 @@ namespace SDRSharp.Tetra.MultiChannel
         {
             if (length <= 0) return;
 
+            // Some SDR# frontends / device plugins (notably Airspy in certain builds)
+            // may invoke RawIQ hooks with samplerate = 0. That breaks the DDC chain.
+            // Fallback to the control-level sample rate if needed.
+            if (samplerate <= 1)
+            {
+                var fs = TryGetSampleRateHz(_control);
+                if (fs > 1) samplerate = fs;
+            }
+
             LastSampleRate = samplerate;
 
             var arr = ArrayPool<Complex>.Shared.Rent(length);
@@ -74,6 +83,7 @@ namespace SDRSharp.Tetra.MultiChannel
             {
                 _queue.Enqueue((arr, length, samplerate));
                 Monitor.Pulse(_lock);
+
                 // Limit backlog to avoid RAM spike
                 while (_queue.Count > 8)
                 {
@@ -81,6 +91,69 @@ namespace SDRSharp.Tetra.MultiChannel
                     ArrayPool<Complex>.Shared.Return(old.buf);
                 }
             }
+        }
+
+        private static double TryGetSampleRateHz(ISharpControl control)
+        {
+            if (control == null) return 0;
+
+            // Try common property names on the control itself
+            var t = control.GetType();
+            foreach (var name in new[]
+            {
+                "SampleRate",
+                "InputSampleRate",
+                "BasebandSampleRate",
+                "SamplingRate",
+                "DeviceSampleRate",
+                "OutputSampleRate"
+            })
+            {
+                var pi = t.GetProperty(name);
+                if (pi == null) continue;
+
+                try
+                {
+                    var v = pi.GetValue(control, null);
+                    if (v is int i) return i;
+                    if (v is long l) return l;
+                    if (v is double d) return d;
+                    if (v is float f) return f;
+                }
+                catch { }
+            }
+
+            // Some builds expose the underlying source object via a property like "Source"
+            var srcProp = t.GetProperty("Source") ?? t.GetProperty("Frontend") ?? t.GetProperty("Device");
+            if (srcProp != null)
+            {
+                try
+                {
+                    var src = srcProp.GetValue(control, null);
+                    if (src != null)
+                    {
+                        var st = src.GetType();
+                        foreach (var name in new[] { "SampleRate", "InputSampleRate", "BasebandSampleRate", "SamplingRate", "OutputSampleRate" })
+                        {
+                            var pi = st.GetProperty(name);
+                            if (pi == null) continue;
+
+                            try
+                            {
+                                var v = pi.GetValue(src, null);
+                                if (v is int i) return i;
+                                if (v is long l) return l;
+                                if (v is double d) return d;
+                                if (v is float f) return f;
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            return 0;
         }
 
         private void Worker()
