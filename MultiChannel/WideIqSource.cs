@@ -10,7 +10,10 @@ namespace SDRSharp.Tetra.MultiChannel
     public unsafe class WideIqSource : IDisposable
     {
         private readonly ISharpControl _control;
-        private readonly WideIqProcessor _proc;
+
+        // Two processors: prefer RawIQ, fallback to BasebandIQ
+        private readonly WideIqProcessor _rawProc;
+        private readonly WideIqProcessor _bbProc;
 
         private readonly object _lock = new();
         private readonly Queue<(Complex[] buf, int len, double fs)> _queue = new();
@@ -19,24 +22,34 @@ namespace SDRSharp.Tetra.MultiChannel
         private Thread _worker;
         private volatile bool _running;
 
-        /// <summary>
-        /// Last observed IQ sample rate (Hz) from the wideband IQ stream.
-        /// Not all SDR# builds expose a control-level SampleRate property,
-        /// so we cache it here from the incoming IQ callback.
-        /// </summary>
         public double LastSampleRate { get; private set; }
+
+        private enum ActiveStream { Unknown, RawIQ, BasebandIQ }
+        private volatile ActiveStream _active = ActiveStream.Unknown;
+
+        // Heuristics / stability detection
+        private int _rawBadCount = 0;
+        private int _rawGoodCount = 0;
+
+        // Tune these if needed
+        private const int RawGoodThreshold = 3;   // callbacks with sane fs before we "lock" to Raw
+        private const int RawBadThreshold  = 10;  // callbacks with fs<=1 / NaN before we switch to Baseband
 
         public WideIqSource(ISharpControl control)
         {
             _control = control;
-            _proc = new WideIqProcessor();
-            _proc.IQReady += OnIqReady;
-            _proc.Enabled = true;
 
-            // Try to hook the widest available IQ.
-            // NOTE: Some SDR# builds may not expose RawIQ; if you need to change this,
-            // edit the ProcessorType below.
-            _control.RegisterStreamHook(_proc, ProcessorType.RawIQ);
+            _rawProc = new WideIqProcessor();
+            _rawProc.IQReady += (p, fs, len) => OnIqReady(ActiveStream.RawIQ, p, fs, len);
+            _rawProc.Enabled = true;
+
+            _bbProc = new WideIqProcessor();
+            _bbProc.IQReady += (p, fs, len) => OnIqReady(ActiveStream.BasebandIQ, p, fs, len);
+            _bbProc.Enabled = true;
+
+            // Register both. We will pick the best at runtime.
+            _control.RegisterStreamHook(_rawProc, ProcessorType.RawIQ);
+            _control.RegisterStreamHook(_bbProc, ProcessorType.BasebandIQ);
 
             _running = true;
             _worker = new Thread(Worker) { IsBackground = true, Name = "TetraWideIQ" };
@@ -60,21 +73,69 @@ namespace SDRSharp.Tetra.MultiChannel
             }
         }
 
-        private void OnIqReady(Complex* samples, double samplerate, int length)
+        private void OnIqReady(ActiveStream stream, Complex* samples, double samplerate, int length)
         {
-            if (length <= 0) return;
+            if (!_running || length <= 0) return;
 
-            // Some SDR# frontends / device plugins (notably Airspy in certain builds)
-            // may invoke RawIQ hooks with samplerate = 0. That breaks the DDC chain.
-            // Fallback to the control-level sample rate if needed.
-            if (samplerate <= 1)
+            // Normalize samplerate if missing/invalid (Airspy RawIQ often hits this)
+            if (!IsSaneSampleRate(samplerate))
             {
-                var fs = TryGetSampleRateHz(_control);
-                if (fs > 1) samplerate = fs;
+                var fsFallback = TryGetSampleRateHz(_control);
+                if (IsSaneSampleRate(fsFallback))
+                    samplerate = fsFallback;
             }
+
+            // Decide active stream
+            // 1) If unknown -> try to lock to RawIQ if it looks good quickly; else allow BasebandIQ.
+            // 2) If locked to RawIQ but it keeps being bad -> switch to BasebandIQ.
+            if (_active == ActiveStream.Unknown)
+            {
+                if (stream == ActiveStream.RawIQ)
+                {
+                    if (IsSaneSampleRate(samplerate)) _rawGoodCount++;
+                    else _rawBadCount++;
+
+                    if (_rawGoodCount >= RawGoodThreshold)
+                        _active = ActiveStream.RawIQ;
+
+                    // If RawIQ seems broken, allow BasebandIQ to take over
+                    if (_rawBadCount >= RawBadThreshold)
+                        _active = ActiveStream.BasebandIQ;
+                }
+                else if (stream == ActiveStream.BasebandIQ)
+                {
+                    // If baseband is sane and RawIQ is not proving itself, we can go baseband
+                    if (IsSaneSampleRate(samplerate) && _rawGoodCount == 0 && _rawBadCount >= 3)
+                        _active = ActiveStream.BasebandIQ;
+
+                    // Also: if baseband is the first sane stream we see, pick it.
+                    if (IsSaneSampleRate(samplerate) && _rawGoodCount == 0 && _rawBadCount == 0)
+                        _active = ActiveStream.BasebandIQ;
+                }
+            }
+            else if (_active == ActiveStream.RawIQ)
+            {
+                // If we are using RawIQ but it's now consistently invalid, fall back
+                if (stream == ActiveStream.RawIQ)
+                {
+                    if (!IsSaneSampleRate(samplerate)) _rawBadCount++;
+                    else _rawBadCount = 0;
+
+                    if (_rawBadCount >= RawBadThreshold)
+                        _active = ActiveStream.BasebandIQ;
+                }
+            }
+
+            // Only forward samples from the active stream
+            if (_active != stream)
+                return;
+
+            if (!IsSaneSampleRate(samplerate))
+                return; // Don't poison downstream DDC with 0/NaN
 
             LastSampleRate = samplerate;
 
+            // Copy samples into managed buffer (pooled)
             var arr = ArrayPool<Complex>.Shared.Rent(length);
             for (int i = 0; i < length; i++)
                 arr[i] = samples[i];
@@ -84,7 +145,7 @@ namespace SDRSharp.Tetra.MultiChannel
                 _queue.Enqueue((arr, length, samplerate));
                 Monitor.Pulse(_lock);
 
-                // Limit backlog to avoid RAM spike
+                // Limit backlog
                 while (_queue.Count > 8)
                 {
                     var old = _queue.Dequeue();
@@ -93,11 +154,18 @@ namespace SDRSharp.Tetra.MultiChannel
             }
         }
 
+        private static bool IsSaneSampleRate(double fs)
+        {
+            if (double.IsNaN(fs) || double.IsInfinity(fs)) return false;
+            // sanity: >= 8 kHz and <= 50 MHz (very generous bounds)
+            return fs >= 8000 && fs <= 50_000_000;
+        }
+
         private static double TryGetSampleRateHz(ISharpControl control)
         {
             if (control == null) return 0;
 
-            // Try common property names on the control itself
+            // Common property names on the control itself
             var t = control.GetType();
             foreach (var name in new[]
             {
@@ -123,7 +191,7 @@ namespace SDRSharp.Tetra.MultiChannel
                 catch { }
             }
 
-            // Some builds expose the underlying source object via a property like "Source"
+            // Some builds expose underlying source/front-end via Source/Frontend/Device
             var srcProp = t.GetProperty("Source") ?? t.GetProperty("Frontend") ?? t.GetProperty("Device");
             if (srcProp != null)
             {
@@ -133,7 +201,15 @@ namespace SDRSharp.Tetra.MultiChannel
                     if (src != null)
                     {
                         var st = src.GetType();
-                        foreach (var name in new[] { "SampleRate", "InputSampleRate", "BasebandSampleRate", "SamplingRate", "OutputSampleRate" })
+                        foreach (var name in new[]
+                        {
+                            "SampleRate",
+                            "InputSampleRate",
+                            "BasebandSampleRate",
+                            "SamplingRate",
+                            "DeviceSampleRate",
+                            "OutputSampleRate"
+                        })
                         {
                             var pi = st.GetProperty(name);
                             if (pi == null) continue;
@@ -194,7 +270,8 @@ namespace SDRSharp.Tetra.MultiChannel
             lock (_lock) { Monitor.PulseAll(_lock); }
             try { _worker?.Join(500); } catch { }
 
-            // No explicit unregister API in SDR# stream hooks, so we just stop dispatching.
+            // SDR# doesn't provide an unregister hook in the public API.
+            // We simply stop dispatching.
         }
     }
 
